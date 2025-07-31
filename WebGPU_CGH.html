@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGPU CGH（GPU）</title>
+  <style>
+    canvas { border: 1px solid black; margin-top: 10px; }
+    #controls { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>WebGPU CGH</h1>
+
+  <input type="file" id="fileInput" accept=".csv">
+  <button id="runBtn">CGH計算</button>
+
+  <div id="controls">
+    <input type="text" id="filenameInput" placeholder="保存ファイル名（拡張子不要）">
+    <button id="saveBtn">画像保存（.bmp）</button>
+  </div>
+
+  <canvas id="cghCanvas" width="1024" height="1024"></canvas>
+
+  <script type="module">
+    const fileInput = document.getElementById('fileInput');
+    const runBtn = document.getElementById('runBtn');
+    const saveBtn = document.getElementById('saveBtn');
+    const canvas = document.getElementById('cghCanvas');
+    const ctx = canvas.getContext('2d');
+    const filenameInput = document.getElementById('filenameInput');
+
+    let pointData = [];
+    let isRunning = false;
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      const text = await file.text();
+      const lines = text.trim().split('\n');
+      pointData = lines.map(line => {
+        const [x, y, z, amp = 1] = line.split(',').map(Number);
+        return { x, y, z, amp };
+      });
+      console.log(`読み込んだ点光源数: ${pointData.length}`);
+    });
+
+    runBtn.addEventListener('click', async () => {
+      if (isRunning) return;
+      isRunning = true;
+
+      if (!navigator.gpu) {
+        alert('WebGPU未対応');
+        isRunning = false;
+        return;
+      }
+
+      if (pointData.length === 0) {
+        alert('点光源データが読み込まれていません。CSVファイルを選択してください。');
+        isRunning = false;
+        return;
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+      const width = 1024, height = 1024;
+
+      const floatArray = new Float32Array(pointData.length * 4);
+      for (let i = 0; i < pointData.length; i++) {
+        floatArray.set([
+          pointData[i].x,
+          pointData[i].y,
+          pointData[i].z,
+          pointData[i].amp ?? 1.0
+        ], i * 4);
+      }
+
+      const pointBuffer = device.createBuffer({
+        size: floatArray.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true
+      });
+      new Float32Array(pointBuffer.getMappedRange()).set(floatArray);
+      pointBuffer.unmap();
+
+      const outputBuffer = device.createBuffer({
+        size: width * height * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+      });
+
+      let maxZ = pointData.reduce((max, p) => Math.max(max, p.z), 0);
+      let pitch = 0.000008;
+      let lambda = 0.000000532;
+      let xmax = lambda * maxZ / (2 * pitch);
+      console.log(`x_max: ${xmax}`);
+
+      const shaderCode = `
+       struct Point {
+        x: f32,
+        y: f32,
+        z: f32,
+        amp: f32,
+      };
+
+      struct Image {
+        pixels: array<f32>,
+      };
+
+      @group(0) @binding(0) var<storage, read> pointCloud: array<Point>;
+      @group(0) @binding(1) var<storage, read_write> outputImage: Image;
+
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let width: u32 = 1024u;
+        let height: u32 = 1024u;
+
+        if (gid.x >= width || gid.y >= height) {
+          return;
+        }
+
+        let index = gid.y * width + gid.x;
+        var sumRe: f32 = 0.0;
+        var sumIm: f32 = 0.0;
+
+        let pitch: f32 = 0.000008;
+        let lambda: f32 = 0.000000532;
+        let PI: f32 = 3.1415927 ;
+        let k: f32 = 2 * PI / lambda;
+
+        for (var i = 0u; i < arrayLength(&pointCloud); i = i + 1u) {
+          let p = pointCloud[i];
+          let dx = pitch * (f32(gid.x) - p.x);
+          let dy = pitch * (f32(gid.y) - p.y);
+          let dz = p.z;
+          let r = sqrt(dx * dx + dy * dy + dz * dz + 1e-6);
+          let phase = k * r;
+          sumRe = sumRe + p.amp * cos(phase);
+          sumIm = sumIm + p.amp * sin(phase);
+        }
+
+        let phaseAngle = atan2(sumIm, sumRe) + PI;
+        let normPhase = (phaseAngle + PI) / (2.0 * PI);
+        outputImage.pixels[index] = normPhase;
+      }
+      `;
+
+      const shaderModule = device.createShaderModule({ code: shaderCode });
+      const pipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: shaderModule, entryPoint: 'main' }
+      });
+
+      const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: pointBuffer } },
+          { binding: 1, resource: { buffer: outputBuffer } }
+        ]
+      });
+
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+
+      const readBuffer = device.createBuffer({
+        size: width * height * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+
+      const encoder2 = device.createCommandEncoder();
+      encoder2.copyBufferToBuffer(outputBuffer, 0, readBuffer, 0, width * height * 4);
+      device.queue.submit([encoder2.finish()]);
+
+      await readBuffer.mapAsync(GPUMapMode.READ);
+      const arrayBuffer = readBuffer.getMappedRange();
+      const floatData = new Float32Array(arrayBuffer);
+
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < floatData.length; i++) {
+        if (floatData[i] < min) min = floatData[i];
+        if (floatData[i] > max) max = floatData[i];
+      }
+
+      const imageData = new Uint8ClampedArray(width * height * 4);
+      for (let i = 0; i < floatData.length; i++) {
+        const norm = (floatData[i] - min) / (max - min + 1e-6);
+        const gray = Math.floor(norm * 255);
+        imageData[i * 4 + 0] = gray;
+        imageData[i * 4 + 1] = gray;
+        imageData[i * 4 + 2] = gray;
+        imageData[i * 4 + 3] = 255;
+      }
+
+      const img = new ImageData(imageData, width, height);
+      ctx.putImageData(img, 0, 0);
+
+      readBuffer.unmap();
+      isRunning = false;
+    });
+
+    saveBtn.addEventListener('click', () => {
+      const width = canvas.width;
+      const height = canvas.height;
+      const imageData = ctx.getImageData(0, 0, width, height);
+      const pixels = imageData.data;
+
+      const rowSize = ((24 * width + 31) >> 5) << 2;
+      const imageSize = rowSize * height;
+      const fileSize = 54 + imageSize;
+      const buffer = new ArrayBuffer(fileSize);
+      const view = new DataView(buffer);
+
+      view.setUint8(0, 0x42); // B
+      view.setUint8(1, 0x4D); // M
+      view.setUint32(2, fileSize, true);
+      view.setUint32(6, 0, true);
+      view.setUint32(10, 54, true);
+
+      view.setUint32(14, 40, true);
+      view.setInt32(18, width, true);
+      view.setInt32(22, -height, true);
+      view.setUint16(26, 1, true);
+      view.setUint16(28, 24, true);
+      view.setUint32(30, 0, true);
+      view.setUint32(34, imageSize, true);
+      view.setInt32(38, 2835, true);
+      view.setInt32(42, 2835, true);
+      view.setUint32(46, 0, true);
+      view.setUint32(50, 0, true);
+
+      let offset = 54;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          view.setUint8(offset++, pixels[i + 2]); // B
+          view.setUint8(offset++, pixels[i + 1]); // G
+          view.setUint8(offset++, pixels[i + 0]); // R
+        }
+        while ((offset - 54) % rowSize !== 0) {
+          view.setUint8(offset++, 0);
+        }
+      }
+
+      const blob = new Blob([buffer], { type: 'image/bmp' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+
+      const name = filenameInput.value.trim();
+      link.download = name ? `${name}.bmp` : 'cgh_zoneplate.bmp';
+      link.click();
+    });
+  </script>
+</body>
+</html>
