@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed WebGPU Client</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; }
+        #status, #taskStatus, #playbackStatus { font-size: 1.2em; font-weight: bold; padding: 10px; border-radius: 5px; margin: 1em 0; }
+        .status-idle { background-color: #eee; color: #333; }
+        .status-working { background-color: #e3f2fd; color: #1565c0; }
+        .status-success { background-color: #e8f5e9; color: #2e7d32; }
+        .status-error { background-color: #ffebee; color: #c62828; }
+        button { font-size: 1.2em; padding: 15px 25px; cursor: pointer; margin-top: 5px; }
+        canvas { border: 1px solid black; margin-top: 10px; max-width: 100%; height: auto; background-color: #000; }
+        /* 再生エリア */
+        #playbackDisplay { border: 1px solid black; margin-top: 10px; max-width: 100%; height: auto; background-color: #000; }
+        #playbackDisplay:fullscreen { width: 100vw; height: 100vh; object-fit: contain; background-color: black; }
+    </style>
+</head>
+<body>
+
+    <h1>WebGPU Distributed Client</h1>
+    
+    <script>
+        const SERVER_IP = '172.22.41.86'; // ★サーバーIP
+        const SERVER_BASE_URL = `http://${SERVER_IP}:8080`;
+    </script>
+
+    <h2>1. 分散計算に参加</h2>
+    <p>サーバーからタスクを自動で取得し、計算結果を返します。</p>
+    <button id="joinBtn">🚀 計算開始 (自動ループ)</button>
+    <div id="taskStatus" class="status-idle">待機中</div>
+
+    <canvas id="cghCanvas" width="1024" height="1024"></canvas>
+
+    <hr style="margin: 2em 0;">
+
+    <h2>2. サーバー上のフレーム再生</h2>
+    <button id="playbackBtn">🎬 再生開始 (全画面)</button>
+    <div id="playbackStatus" class="status-idle">...</div>
+    <img id="playbackDisplay" width="512" height="512" alt="Playback">
+
+    <script type="module">
+        const joinBtn = document.getElementById('joinBtn');
+        const taskStatus = document.getElementById('taskStatus');
+        const canvas = document.getElementById('cghCanvas');
+        const ctx = canvas.getContext('2d');
+        let isWorking = false;
+
+        function updateStatus(el, msg, type) {
+            el.textContent = msg;
+            el.className = 'status-' + type;
+        }
+
+        // --- 分散計算ループ ---
+        joinBtn.addEventListener('click', async () => {
+            if (isWorking) return;
+            isWorking = true;
+            joinBtn.disabled = true;
+            joinBtn.textContent = "計算中...";
+
+            try {
+                if (!navigator.gpu) throw new Error('WebGPU未対応');
+                const adapter = await navigator.gpu.requestAdapter();
+                const device = await adapter.requestDevice();
+
+                while (true) {
+                    // 1. タスク取得
+                    updateStatus(taskStatus, "タスクを要求中...", "working");
+                    const taskRes = await fetch(`${SERVER_BASE_URL}/api/get_task`);
+                    if (!taskRes.ok) throw new Error("サーバー通信エラー");
+                    
+                    const task = await taskRes.json();
+                    
+                    // タスクがもうない場合
+                    if (task.finished) {
+                        updateStatus(taskStatus, "全てのタスクが完了しました！お疲れ様でした。", "success");
+                        break;
+                    }
+
+                    updateStatus(taskStatus, `Task ID: ${task.id} (${task.filename}) を計算中...`, "working");
+
+                    // 2. CSVパース
+                    // (JSON内の改行文字 \n を実際の改行に戻して処理)
+                    // ※サーバー側で簡易エスケープしているので、ここではそのままsplitでOKな場合も多いですが念のため
+                    const pointData = task.csv_data.split('\n').filter(l => l.trim() !== "").map(l => {
+                        const [x, y, z, amp=1] = l.split(',').map(Number);
+                        return {x, y, z, amp};
+                    });
+
+                    // 3. WebGPU計算
+                    const width = 1024; 
+                    const height = 1024;
+                    canvas.width = width; canvas.height = height;
+
+                    const floatArray = new Float32Array(pointData.length * 4);
+                    pointData.forEach((p, i) => floatArray.set([p.x, p.y, p.z, p.amp], i * 4));
+
+                    // Buffer作成
+                    const pointBuffer = device.createBuffer({ size: floatArray.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, mappedAtCreation: true });
+                    new Float32Array(pointBuffer.getMappedRange()).set(floatArray);
+                    pointBuffer.unmap();
+
+                    const outputBuffer = device.createBuffer({ size: width * height * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+
+                    // Shader
+                    const shaderModule = device.createShaderModule({ code: `
+                        struct Point { x: f32, y: f32, z: f32, amp: f32, };
+                        struct Image { pixels: array<f32>, };
+                        @group(0) @binding(0) var<storage, read> points: array<Point>;
+                        @group(0) @binding(1) var<storage, read_write> img: Image;
+                        @compute @workgroup_size(8, 8)
+                        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                            let w = ${width}u; let h = ${height}u;
+                            if (gid.x >= w || gid.y >= h) { return; }
+                            let idx = gid.y * w + gid.x;
+                            var re = 0.0; var im = 0.0;
+                            let pitch = 0.000008; let k = 11810467.0;
+                            for (var i=0u; i<arrayLength(&points); i++) {
+                                let p = points[i];
+                                let dx = pitch * (f32(gid.x) - p.x);
+                                let dy = pitch * (f32(gid.y) - p.y);
+                                let r = sqrt(dx*dx + dy*dy + p.z*p.z);
+                                let ph = k * r;
+                                re += p.amp * cos(ph); im += p.amp * sin(ph);
+                            }
+                            img.pixels[idx] = atan2(im, re) + 3.14159;
+                        }
+                    `});
+
+                    const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module: shaderModule, entryPoint: 'main' } });
+                    const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: pointBuffer } }, { binding: 1, resource: { buffer: outputBuffer } }] });
+
+                    const cmd = device.createCommandEncoder();
+                    const pass = cmd.beginComputePass();
+                    pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup);
+                    pass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+                    pass.end();
+
+                    // 結果読み出し
+                    const readBuffer = device.createBuffer({ size: width * height * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+                    cmd.copyBufferToBuffer(outputBuffer, 0, readBuffer, 0, width * height * 4);
+                    device.queue.submit([cmd.finish()]);
+                    await readBuffer.mapAsync(GPUMapMode.READ);
+                    const resultData = new Float32Array(readBuffer.getMappedRange().slice(0));
+                    readBuffer.unmap();
+
+                    // Canvasプレビュー (処理速度向上のため省略可能だが、進捗確認用に表示)
+                    let min=Infinity, max=-Infinity;
+                    // 高速化のためサンプリングしてmin/max探すか、固定値でもよい
+                    for(let i=0; i<resultData.length; i+=100) { if(resultData[i]<min) min=resultData[i]; if(resultData[i]>max) max=resultData[i]; }
+                    const range = max - min || 1;
+                    const imgData = new Uint8ClampedArray(width * height * 4);
+                    for(let i=0; i<resultData.length; i++) {
+                        const val = Math.floor(((resultData[i] - min) / range) * 255);
+                        imgData[i*4] = val; imgData[i*4+1] = val; imgData[i*4+2] = val; imgData[i*4+3] = 255;
+                    }
+                    ctx.putImageData(new ImageData(imgData, width, height), 0, 0);
+
+                    // 4. 結果アップロード (タスクIDを使用)
+                    updateStatus(taskStatus, `Task ID: ${task.id} をアップロード中...`, "working");
+                    const uploadUrl = `${SERVER_BASE_URL}/api/upload_frame?frame=${task.id}&width=${width}&height=${height}`; // ★ここが重要
+                    
+                    await fetch(uploadUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/octet-stream' },
+                        body: resultData.buffer
+                    });
+
+                    // 少し待機 (サーバー負荷軽減)
+                    await new Promise(r => setTimeout(r, 50));
+                }
+
+            } catch (e) {
+                console.error(e);
+                updateStatus(taskStatus, "エラー発生: " + e.message, "error");
+                joinBtn.disabled = false;
+                joinBtn.textContent = "再試行";
+            } finally {
+                isWorking = false;
+            }
+        });
+
+        // --- 再生機能 (変更なし) ---
+        const playbackBtn = document.getElementById('playbackBtn');
+        const playbackDisplay = document.getElementById('playbackDisplay');
+        const playbackStatus = document.getElementById('playbackStatus');
+        let isPlaying = false;
+
+        playbackBtn.addEventListener('click', async () => {
+            if (isPlaying) return;
+            isPlaying = true;
+            playbackBtn.disabled = true;
+
+            if (playbackDisplay.requestFullscreen) await playbackDisplay.requestFullscreen();
+            else if (playbackDisplay.webkitRequestFullscreen) await playbackDisplay.webkitRequestFullscreen();
+
+            try {
+                for (let i = 0; ; i++) {
+                    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                         // フルスクリーン解除で止めたければ break;
+                    }
+                    const name = `frame_${String(i).padStart(5, '0')}.bmp`;
+                    updateStatus(playbackStatus, `Frame ${i}`, "working");
+                    
+                    const res = await fetch(`${SERVER_BASE_URL}/api/get_frame/${name}`);
+                    if (!res.ok) break; // 404なら終了
+                    
+                    const blob = await res.blob();
+                    playbackDisplay.src = URL.createObjectURL(blob);
+                    await new Promise(r => setTimeout(r, 100)); // 10 FPS
+                }
+                updateStatus(playbackStatus, "再生終了", "success");
+            } finally {
+                isPlaying = false;
+                playbackBtn.disabled = false;
+                if (document.exitFullscreen) document.exitFullscreen();
+            }
+        });
+    </script>
+</body>
+</html>
