@@ -71,13 +71,16 @@
                 const device = await adapter.requestDevice();
 
                 while (true) {
+
+                    updateStatus(taskStatus, "HOGEHOGE");
+                    
                     // 1. タスク取得
                     updateStatus(taskStatus, "タスクを要求中...", "working");
                     const taskRes = await fetch(`${SERVER_BASE_URL}/api/get_task`);
                     if (!taskRes.ok) throw new Error("サーバー通信エラー");
                     
 
-                    updateStatus(taskStatus, "HOGEHOGE");
+
 
 
                     const task = await taskRes.json();
@@ -230,3 +233,4 @@
     </script>
 </body>
 </html>
+
