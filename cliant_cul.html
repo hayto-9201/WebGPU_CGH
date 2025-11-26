@@ -60,6 +60,11 @@
             joinBtn.disabled = true;
             joinBtn.textContent = "計算中...";
 
+   
+
+            
+
+
             try {
                 if (!navigator.gpu) throw new Error('WebGPU未対応');
                 const adapter = await navigator.gpu.requestAdapter();
@@ -70,6 +75,12 @@
                     updateStatus(taskStatus, "タスクを要求中...", "working");
                     const taskRes = await fetch(`${SERVER_BASE_URL}/api/get_task`);
                     if (!taskRes.ok) throw new Error("サーバー通信エラー");
+                    
+
+
+                    console.log('abc');
+                    continue;
+
                     
                     const task = await taskRes.json();
                     
@@ -221,4 +232,3 @@
     </script>
 </body>
 </html>
-
