@@ -77,11 +77,9 @@
                     if (!taskRes.ok) throw new Error("サーバー通信エラー");
                     
 
+                    updateStatus(taskStatus, "HOGEHOGE");
 
-                    console.log('abc');
-                    continue;
 
-                    
                     const task = await taskRes.json();
                     
                     // タスクがもうない場合
