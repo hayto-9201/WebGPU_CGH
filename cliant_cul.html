@@ -23,7 +23,7 @@
     <h1>WebGPU Distributed Client</h1>
     
     <script>
-        const SERVER_IP = '172.22.41.86'; // ★サーバーIP
+        const SERVER_IP = '192.168.137.1'; // ★サーバーIP
         const SERVER_BASE_URL = `http://${SERVER_IP}:8080`;
     </script>
 
@@ -60,29 +60,17 @@
             joinBtn.disabled = true;
             joinBtn.textContent = "計算中...";
 
-   
-
-            
-
-
             try {
                 if (!navigator.gpu) throw new Error('WebGPU未対応');
                 const adapter = await navigator.gpu.requestAdapter();
                 const device = await adapter.requestDevice();
 
                 while (true) {
-
-                    //updateStatus(taskStatus, "HOGEHOGE");
-                    
                     // 1. タスク取得
                     updateStatus(taskStatus, "タスクを要求中...", "working");
                     const taskRes = await fetch(`${SERVER_BASE_URL}/api/get_task`);
                     if (!taskRes.ok) throw new Error("サーバー通信エラー");
                     
-
-
-
-
                     const task = await taskRes.json();
                     
                     // タスクがもうない場合
@@ -233,6 +221,3 @@
     </script>
 </body>
 </html>
-
-
-
